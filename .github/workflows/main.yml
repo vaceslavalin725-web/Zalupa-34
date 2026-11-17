@@ -1,0 +1,417 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'ISLAND_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.island"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.island"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          ISLAND_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'ISLAND_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <application
+                  android:label="Dynamic Island"
+                  android:icon="@android:drawable/ic_dialog_info"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".IslandService"
+                      android:exported="true"
+                      android:label="Dynamic Island"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+                  <service
+                      android:name=".NotifListener"
+                      android:exported="true"
+                      android:label="Dynamic Island notifications"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          ISLAND_EOF
+          mkdir -p app/src/main/java/com/example/island
+          cat > app/src/main/java/com/example/island/IslandBus.kt <<'ISLAND_EOF'
+          package com.example.island
+
+          import android.app.PendingIntent
+          import android.graphics.drawable.Drawable
+
+          class IslandAction(val label: String, val run: () -> Unit)
+
+          enum class Kind { NOTIFICATION, CALL, MEDIA, TIMER, CHARGING }
+
+          data class IslandEvent(
+              val kind: Kind = Kind.NOTIFICATION,
+              val icon: Drawable? = null,
+              val title: String = "",
+              val text: String = "",
+              val compactText: String = "",
+              val intent: PendingIntent? = null,
+              val actions: List<IslandAction> = emptyList(),
+              val tintIcon: Boolean = true,
+              val accent: Int = 0xFFFFFFFF.toInt(),
+              val sticky: Boolean = false,
+              val progress: Float = -1f,
+              val key: String = ""
+          )
+
+          /** Шина между сервисами/приложением и островком (один процесс). */
+          object IslandBus {
+              var onTransient: ((IslandEvent) -> Unit)? = null
+              var onLive: ((Kind, IslandEvent?) -> Unit)? = null
+              var onRemoved: ((String) -> Unit)? = null
+              var onStartTimer: ((Int) -> Unit)? = null
+              var onStopTimer: (() -> Unit)? = null
+              var onRecalibrate: (() -> Unit)? = null
+
+              fun post(e: IslandEvent) { onTransient?.invoke(e) }
+              fun live(k: Kind, e: IslandEvent?) { onLive?.invoke(k, e) }
+              fun removed(key: String) { onRemoved?.invoke(key) }
+          }
+          ISLAND_EOF
+          mkdir -p app/src/main/java/com/example/island
+          cat > app/src/main/java/com/example/island/IslandService.kt <<'ISLAND_EOF'
+          package com.example.island
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.res.Configuration
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.hardware.display.DisplayManager
+          import android.media.AudioManager
+          import android.os.BatteryManager
+          import android.os.CountDownTimer
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.VibratorManager
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.FrameLayout
+          import androidx.core.content.ContextCompat
+
+          private val GREEN = 0xFF30D158.toInt()
+          private val ORANGE = 0xFFFF9F0A.toInt()
+          private val RED = 0xFFFF453A.toInt()
+          private val WHITE = 0xFFFFFFFF.toInt()
+
+          class IslandService : AccessibilityService() {
+              private lateinit var wm: WindowManager
+              private lateinit var host: FrameLayout
+              private lateinit var island: IslandView
+              private lateinit var params: WindowManager.LayoutParams
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var current: IslandEvent? = null
+              private val live = linkedMapOf<Kind, IslandEvent>()
+              private var shownKey = ""
+              private var timer: CountDownTimer? = null
+              private val dismissCurrent = Runnable { current = null; refresh() }
+
+              private val system = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      when (i.action) {
+                          Intent.ACTION_POWER_CONNECTED -> if (Prefs.on(c, "charge")) charging(c)
+                          Intent.ACTION_BATTERY_LOW -> if (Prefs.on(c, "charge")) {
+                              val p = batteryPct(c)
+                              show(IslandEvent(Kind.CHARGING, c.getDrawable(android.R.drawable.ic_lock_idle_low_battery),
+                                  "Низкий заряд", "$p%", accent = RED, progress = p / 100f, key = "low"))
+                          }
+                          AudioManager.RINGER_MODE_CHANGED_ACTION -> if (Prefs.on(c, "ringer")) ringer(c)
+                      }
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  autoCalibrate()
+                  host = FrameLayout(this)
+                  island = IslandView(this)
+                  host.addView(island)
+                  params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  }
+                  place(false)
+                  wm.addView(host, params)
+
+                  island.onTap = {
+                      val t = current
+                      if (t != null) {
+                          runCatching { t.intent?.send() }
+                          if (!t.sticky) { handler.removeCallbacks(dismissCurrent); current = null; refresh() }
+                      } else {
+                          currentLive()?.let { show(it.copy(sticky = false)) }
+                      }
+                  }
+                  island.onLongPress = { currentLive()?.let { show(it.copy(sticky = false)) } }
+                  island.onDismiss = { handler.removeCallbacks(dismissCurrent); current = null; refresh() }
+
+                  IslandBus.onTransient = { e -> handler.post { show(e) } }
+                  IslandBus.onLive = { k, e ->
+                      handler.post {
+                          if (e == null) live.remove(k) else live[k] = e
+                          refresh()
+                      }
+                  }
+                  IslandBus.onRemoved = { key ->
+                      handler.post {
+                          if (current?.key == key) { handler.removeCallbacks(dismissCurrent); current = null; refresh() }
+                      }
+                  }
+                  IslandBus.onStartTimer = { sec -> handler.post { startTimer(sec) } }
+                  IslandBus.onStopTimer = { handler.post { stopTimer() } }
+                  IslandBus.onRecalibrate = {
+                      handler.post {
+                          Prefs.setOn(this, "auto", true)
+                          autoCalibrate()
+                          show(IslandEvent(title = "Камера найдена", text = "Остров выровнен автоматически"))
+                      }
+                  }
+
+                  val f = IntentFilter().apply {
+                      addAction(Intent.ACTION_POWER_CONNECTED)
+                      addAction(Intent.ACTION_BATTERY_LOW)
+                      addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
+                  }
+                  ContextCompat.registerReceiver(this, system, f, ContextCompat.RECEIVER_NOT_EXPORTED)
+              }
+
+              private fun isPortrait() = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+
+              private fun cutoutRects(): List<Rect> {
+                  val a = runCatching { wm.currentWindowMetrics.windowInsets.displayCutout?.boundingRects }.getOrNull()
+                  if (!a.isNullOrEmpty()) return a
+                  val b = runCatching {
+                      getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)?.cutout?.boundingRects
+                  }.getOrNull()
+                  return b ?: emptyList()
+              }
+
+              /** Находит отверстие камеры и сам выставляет положение и размер острова. */
+              private fun autoCalibrate() {
+                  if (!Prefs.on(this, "auto") || !isPortrait()) return
+                  val r = cutoutRects().minByOrNull { it.width() * it.height() } ?: return
+                  val den = resources.displayMetrics.density
+                  val dd = (maxOf(r.width(), r.height()) / den + 6f).toInt().coerceIn(24, 60)
+                  Prefs.set(this, "d", dd)
+                  Prefs.set(this, "x", (r.exactCenterX() / den - dd / 2f).toInt().coerceAtLeast(0))
+                  Prefs.set(this, "y", (r.exactCenterY() / den - dd / 2f).toInt().coerceAtLeast(0))
+              }
+
+              private fun place(touchable: Boolean) {
+                  val den = resources.displayMetrics.density
+                  params.x = (Prefs.x(this) * den).toInt()
+                  params.y = (Prefs.y(this) * den).toInt()
+                  val f = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  params.flags = if (touchable) params.flags and f.inv() else params.flags or f
+                  if (host.isAttachedToWindow) wm.updateViewLayout(host, params)
+              }
+
+              private fun currentLive(): IslandEvent? = live[Kind.TIMER] ?: live[Kind.MEDIA]
+
+              private fun show(e: IslandEvent) {
+                  if (!isPortrait()) return
+                  handler.removeCallbacks(dismissCurrent)
+                  current = e
+                  place(true)
+                  island.showExpanded(e, resources.displayMetrics.widthPixels)
+                  if (!e.sticky) handler.postDelayed(dismissCurrent, 4500)
+              }
+
+              private fun refresh() {
+                  if (current != null) return
+                  val l = currentLive()
+                  if (l != null && isPortrait()) {
+                      val k = l.kind.name + l.title
+                      if (island.mode == IslandView.Mode.COMPACT && k == shownKey) return
+                      shownKey = k
+                      place(true)
+                      island.showCompact(l)
+                  } else {
+                      shownKey = ""
+                      if (island.mode != IslandView.Mode.HIDDEN) { place(false); island.hide() }
+                  }
+              }
+
+              private fun batteryPct(c: Context): Int {
+                  val b = c.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val l = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                  val s = b?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+                  return if (l >= 0) l * 100 / s else 0
+              }
+
+              private fun charging(c: Context) {
+                  val p = batteryPct(c)
+                  show(IslandEvent(Kind.CHARGING, c.getDrawable(android.R.drawable.ic_lock_idle_charging),
+                      "Зарядка", "$p%", accent = GREEN, progress = p / 100f, key = "charge"))
+              }
+
+              private fun ringer(c: Context) {
+                  val am = c.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val (t, ic, col) = when (am.ringerMode) {
+                      AudioManager.RINGER_MODE_SILENT -> Triple("Без звука", android.R.drawable.ic_lock_silent_mode, RED)
+                      AudioManager.RINGER_MODE_VIBRATE -> Triple("Вибрация", android.R.drawable.ic_lock_silent_mode, ORANGE)
+                      else -> Triple("Звук включён", android.R.drawable.ic_lock_silent_mode_off, WHITE)
+                  }
+                  show(IslandEvent(Kind.NOTIFICATION, c.getDrawable(ic), t, "", accent = col, key = "ringer"))
+              }
+
+              private fun startTimer(sec: Int) {
+                  timer?.cancel()
+                  val icon = getDrawable(android.R.drawable.ic_lock_idle_alarm)
+                  val total = sec * 1000L
+                  fun fmt(ms: Long): String { val s = ((ms + 999) / 1000).toInt(); return "%d:%02d".format(s / 60, s % 60) }
+                  live[Kind.TIMER] = IslandEvent(Kind.TIMER, icon, "Таймер", "", fmt(total), accent = ORANGE, progress = 1f)
+                  refresh()
+                  timer = object : CountDownTimer(total, 250) {
+                      override fun onTick(ms: Long) {
+                          val p = ms / total.toFloat()
+                          live[Kind.TIMER]?.let { live[Kind.TIMER] = it.copy(compactText = fmt(ms), progress = p) }
+                          if (current == null && island.mode == IslandView.Mode.COMPACT && currentLive()?.kind == Kind.TIMER) {
+                              island.updateCompact(fmt(ms), p)
+                          }
+                      }
+                      override fun onFinish() {
+                          live.remove(Kind.TIMER)
+                          vibrate()
+                          show(IslandEvent(Kind.TIMER, icon, "Таймер", "Время вышло", accent = ORANGE, progress = 0f, sticky = true,
+                              actions = listOf(IslandAction("Ок") { handler.removeCallbacks(dismissCurrent); current = null; refresh() })))
+                      }
+                  }.start()
+              }
+
+              private fun stopTimer() { timer?.cancel(); live.remove(Kind.TIMER); refresh() }
+
+              private fun vibrate() {
+                  val v = (getSystemService(VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                  v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300, 150, 300), -1))
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  if (!::island.isInitialized) return
+                  if (isPortrait()) {
+                      autoCalibrate(); refresh()
+                  } else {
+                      handler.removeCallbacks(dismissCurrent); current = null
+                      if (island.mode != IslandView.Mode.HIDDEN) { place(false); island.hide() }
+                  }
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  IslandBus.onTransient = null; IslandBus.onLive = null; IslandBus.onRemoved = null
+                  IslandBus.onStartTimer = null; IslandBus.onStopTimer = null; IslandBus.onRecalibrate = null
+                  timer?.cancel()
+                  runCatching { unregisterReceiver(system) }
+                  if (::host.isInitialized) runCatching { wm.removeView(host) }
+                  super.onDestroy()
+              }
+          }
+          ISLAND_EOF
+          mkdir -p app/src/main/java/com/example/island
+          cat > app/src/main/java/com/example/island/IslandView.kt <<'ISLAND_EOF'
+          package com.example.island
+
+          import android.animation.Animator
+          import android.animation.AnimatorListenerAdapter
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Outline
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.text.TextUtils
+          import android.view.GestureDetector
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.ViewOutlineProvider
+          import android.view.animation.DecelerateInterpolator
+          import android.view.animation.LinearInterpolator
+          import android.view.animation.OvershootInterpolator
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+          import kotlin.math.sin
+
+          private val MATCH = ViewG
